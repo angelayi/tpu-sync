@@ -2218,6 +2218,157 @@ INSTANTIATE_TEST_SUITE_P(
       return info.param ? "PSP" : "PlainTcp";
     });
 
+TEST(PeregrineRecvCompleteTest, SplitPostsFromOneSenderCompleteLayerOnce) {
+  MultiSenderReceiverDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1,
+                                       /*num_layers=*/1, /*num_shards=*/4);
+  delegate.ExpectSenders(/*uuid=*/7, /*senders=*/1);
+  BlockTransport transport(&delegate, 0);
+
+  // Sender 3 split its push by source NUMA node: shards {0,1}, then {2,3}.
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{
+          .uuid = 7, .remote_id = 3, .local_id = 0, .shard_mask = 0b0011},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{
+          .uuid = 7, .remote_id = 3, .local_id = 0, .shard_mask = 0b1100},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 1);
+}
+
+TEST(PeregrineRecvCompleteTest, LayerCompletesOnlyAfterEveryDeclaredSender) {
+  MultiSenderReceiverDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1,
+                                       /*num_layers=*/1, /*num_shards=*/2);
+  delegate.ExpectSenders(/*uuid=*/8, /*senders=*/2);
+  BlockTransport transport(&delegate, 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{.uuid = 8, .remote_id = 1, .local_id = 0},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{.uuid = 8, .remote_id = 2, .local_id = 0},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 1);
+}
+
+TEST(PeregrineRecvCompleteTest, DuplicatePushFromSameSenderIsRejected) {
+  MultiSenderReceiverDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1,
+                                       /*num_layers=*/1, /*num_shards=*/2);
+  delegate.ExpectSenders(/*uuid=*/9, /*senders=*/2);
+  BlockTransport transport(&delegate, 0);
+  const lib::PostMetadata post{.uuid = 9, .remote_id = 1, .local_id = 0};
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(post, /*requests=*/{}));
+  // The same sender's push lands again: it must not stand in for the second
+  // declared sender.
+  EXPECT_THAT(transport.OnRecvComplete(post, /*requests=*/{}),
+              StatusIs(absl::StatusCode::kAlreadyExists));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+}
+
+TEST(PeregrineRecvCompleteTest, MoreSendersThanDeclaredIsRejected) {
+  // Two layers so that completing layer 0 does not retire the uuid.
+  MultiSenderReceiverDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1,
+                                       /*num_layers=*/2, /*num_shards=*/1);
+  delegate.ExpectSenders(/*uuid=*/10, /*senders=*/1);
+  BlockTransport transport(&delegate, 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{.uuid = 10, .remote_id = 1, .local_id = 0},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 1);
+
+  EXPECT_THAT(transport.OnRecvComplete(
+                  lib::PostMetadata{.uuid = 10, .remote_id = 2, .local_id = 0},
+                  /*requests=*/{}),
+              StatusIs(absl::StatusCode::kAlreadyExists));
+  EXPECT_EQ(delegate.layer_completion_count(), 1);
+}
+
+TEST(PeregrineRecvCompleteTest, PlanlessSplitPostsCompleteLayerOnce) {
+  // No receive plan: a single sender is expected.
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
+                        /*num_shards=*/2);
+  BlockTransport transport(&delegate, 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{
+          .uuid = 0, .remote_id = 5, .local_id = 0, .shard_mask = 0b01},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{
+          .uuid = 0, .remote_id = 5, .local_id = 0, .shard_mask = 0b10},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.layer_completion_count(), 1);
+}
+
+TEST(PeregrineRecvCompleteTest, PlanDeclaredSplitPostsCountAsOnePush) {
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
+                        /*num_shards=*/2);
+  delegate.SetPoolPushProgress(/*uuid=*/11, /*expected_pushes_per_pool=*/1,
+                               /*transfer_pool_indices=*/{0});
+  BlockTransport transport(&delegate, 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{
+          .uuid = 11, .remote_id = 4, .local_id = 0, .shard_mask = 0b01},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.pool_completion_count(), 0);
+
+  ABSL_EXPECT_OK(transport.OnRecvComplete(
+      lib::PostMetadata{
+          .uuid = 11, .remote_id = 4, .local_id = 0, .shard_mask = 0b10},
+      /*requests=*/{}));
+  EXPECT_EQ(delegate.pool_completion_count(), 1);
+}
+
+TEST(PeregrineRecvCompleteTest, ShardOutOfRangeIsRejected) {
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
+                        /*num_shards=*/2);
+  BlockTransport transport(&delegate, 0);
+
+  EXPECT_THAT(
+      transport.OnRecvComplete(
+          lib::PostMetadata{
+              .uuid = 0, .remote_id = 1, .local_id = 0, .shard_mask = 0b100},
+          /*requests=*/{}),
+      StatusIs(absl::StatusCode::kOutOfRange));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+}
+
+TEST(PeregrineRecvCompleteTest, AllLayerPushIsRejected) {
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
+                        /*num_shards=*/2);
+  BlockTransport transport(&delegate, 0);
+
+  // 0xFFFF'FFFF is the sender's wire encoding of "every layer".
+  EXPECT_THAT(
+      transport.OnRecvComplete(
+          lib::PostMetadata{.uuid = 0, .remote_id = 1, .local_id = 0xFFFF'FFFF},
+          /*requests=*/{}),
+      StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+}
+
+TEST(PeregrineRecvCompleteTest, PerRequestMetadataIsNotInterpretedYet) {
+  MockDelegate delegate(/*slice_size=*/64, /*max_blocks=*/1, /*num_layers=*/1,
+                        /*num_shards=*/2);
+  BlockTransport transport(&delegate, 0);
+  const std::vector<lib::RequestMetadata> requests = {{.shard = 0}};
+
+  EXPECT_THAT(transport.OnRecvComplete(
+                  lib::PostMetadata{.uuid = 0, .remote_id = 1, .local_id = 0},
+                  requests),
+              StatusIs(absl::StatusCode::kUnimplemented));
+  EXPECT_EQ(delegate.layer_completion_count(), 0);
+}
+
 }  // namespace
 }  // namespace transport
 }  // namespace tpu_raiden

@@ -140,6 +140,14 @@ class TransferReceiveSession
   void ExecutePullRequest(KVCacheManagerWithTransfer& manager,
                           const std::string& remote_endpoint);
 
+  // Peregrine receive hook: records first-packet timing the first time any
+  // Post for this session lands.
+  absl::Status OnRecvProgress(KVCacheManagerWithTransfer& manager);
+
+  // Peregrine receive hook: marks the network phase complete and records
+  // last-packet timing once every layer's Posts have landed on this receiver.
+  absl::Status OnRecvNetworkComplete(KVCacheManagerWithTransfer& manager);
+
   // Handles a transport report that |shard_ids| of |block_ids| landed. Each
   // shard's progress is tracked separately; a shard completes once it has
   // received every (layer, block) of the session, and the network phase

@@ -589,6 +589,36 @@ void TransferReceiveSession::ExecutePullRequest(
       });
 }
 
+absl::Status TransferReceiveSession::OnRecvProgress(
+    KVCacheManagerWithTransfer& manager) {
+  absl::MutexLock lock(mu_);
+  if (done_ || draining_) {
+    return absl::OkStatus();
+  }
+  if (!any_blocks_received_) {
+    any_blocks_received_ = true;
+    MetricsCollector* const metrics = manager.metrics_collector_.get();
+    if (metrics != nullptr) {
+      metrics->RecordFirstPacket(uuid_);
+    }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status TransferReceiveSession::OnRecvNetworkComplete(
+    KVCacheManagerWithTransfer& manager) {
+  absl::MutexLock lock(mu_);
+  if (done_ || draining_ || network_completed_) {
+    return absl::OkStatus();
+  }
+  network_completed_ = true;
+  MetricsCollector* const metrics = manager.metrics_collector_.get();
+  if (metrics != nullptr) {
+    metrics->RecordLastPacket(uuid_);
+  }
+  return absl::OkStatus();
+}
+
 absl::Status TransferReceiveSession::OnBlockShardsReceived(
     KVCacheManagerWithTransfer& manager, const std::vector<int>& block_ids,
     absl::Span<const int> shard_ids) {

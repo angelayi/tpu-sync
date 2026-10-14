@@ -89,6 +89,21 @@ using Status = ::peregrine::Status;
 using CompletionCallback =
     absl::AnyInvocable<void(absl::StatusOr<std::vector<int>>)>;
 
+// Application metadata attached to one Post. Identical across the Post's
+// requests.
+struct PostMetadata {
+  uint64_t uuid;
+  uint32_t remote_id;
+  uint32_t local_id;
+  uint16_t shard_mask = 0;
+};
+
+// Application metadata attached to one request of a Post. Expected to grow
+// with what the receiver needs to resolve a request's destination buffer.
+struct RequestMetadata {
+  uint32_t shard;
+};
+
 // Abstract transport adapter interface for Post and Poll operations.
 class TransportAdapter {
  public:

@@ -163,6 +163,11 @@ class BlockTransport final {
   // timed-out plan so the `uuid` can be safely reused.
   void ForgetPushProgress(uint64_t uuid);
 
+  // Receiver-side completion for a Peregrine push: one call per landed Post,
+  // with the Post's metadata and that of each of its requests.
+  absl::Status OnRecvComplete(const lib::PostMetadata& post,
+                              absl::Span<const lib::RequestMetadata> requests);
+
   // Synchronously pushes a buffer identified by `buffer_id` to the remote
   // `peer`, by sending out a `kOpBufferPush ChunkHeader` followed by the data.
   // It waits for a one-byte ack from the `peer` before it returns.
@@ -266,7 +271,8 @@ class BlockTransport final {
   absl::Status CompleteIncomingPush(
       uint64_t uuid, uint32_t local_id, uint32_t remote_id, size_t num_streams,
       size_t landed_shards,
-      const std::optional<PoolPushProgressSpec>& pool_progress_spec);
+      const std::optional<PoolPushProgressSpec>& pool_progress_spec,
+      bool is_peregrine = false);
 
   absl::StatusOr<std::vector<int>> SyncPullInternal(
       const std::vector<std::string>& peers,
@@ -294,8 +300,8 @@ class BlockTransport final {
     struct SenderStreams {
       size_t landed = 0;
       size_t declared = 0;
-      // Plan-declared mode: shards landed beyond the last full shard set; a
-      // full set (one per split push) counts as one landed plan push.
+      // Shards landed beyond the last full shard set; a full set (one per
+      // split push) counts as one landed push.
       size_t landed_shards = 0;
     };
     absl::flat_hash_map<uint32_t, SenderStreams> sender_streams;
@@ -308,6 +314,9 @@ class BlockTransport final {
     std::optional<size_t> expected_senders;
     bool on_layer_received_called = false;
   };
+
+  static size_t AccumulateLandedShards(LayerProgress::SenderStreams& streams,
+                                       size_t shards, size_t full_shards);
 
   void TriggerNextSendStep(std::shared_ptr<SendStreamState> state);
   void ResolveStepCoordinates(const std::shared_ptr<SendStreamState>& state,
