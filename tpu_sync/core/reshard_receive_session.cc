@@ -18,6 +18,7 @@
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <map>
 #include <memory>
 #include <optional>
@@ -38,7 +39,6 @@
 #include "absl/strings/str_cat.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
-#include "xla/tsl/platform/errors.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/utils.h"
@@ -47,6 +47,7 @@
 #include "tpu_sync/rpc/raiden_service.pb.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/telemetry/metrics_backend.h"
+#include "xla/tsl/platform/errors.h"
 
 namespace tpu_raiden {
 
@@ -354,7 +355,8 @@ ReshardReceiveSession::Create(
     StagingBlockAllocator* absl_nullable staging_allocator,
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> chip_blocks,
-    std::chrono::steady_clock::time_point deadline) {
+    std::chrono::steady_clock::time_point deadline,
+    std::shared_ptr<RecvNanCheck>* diagnostic_owner) {
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
@@ -372,7 +374,10 @@ ReshardReceiveSession::Create(
   }
   auto session =
       std::shared_ptr<ReshardReceiveSession>(new ReshardReceiveSession(
-          base, staging_allocator, plan.uuid(), plan, chip_blocks, deadline));
+          base, staging_allocator, plan.uuid(), plan, chip_blocks, deadline,
+          diagnostic_owner == nullptr
+              ? nullptr
+              : RecvNanCheck::CreateIfEnabled(base, plan, diagnostic_owner)));
   TF_RETURN_IF_ERROR(session->AcquireStagingLeases(plan));
   return session;
 }
@@ -382,8 +387,10 @@ ReshardReceiveSession::ReshardReceiveSession(
     StagingBlockAllocator* staging_allocator, uint64_t uuid,
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     absl::Span<const int64_t> chip_blocks,
-    std::chrono::steady_clock::time_point deadline)
+    std::chrono::steady_clock::time_point deadline,
+    std::unique_ptr<RecvNanCheck::Task> recv_nan_check)
     : base_(base),
+      recv_nan_check_(std::move(recv_nan_check)),
       staging_allocator_(staging_allocator),
       uuid_(uuid),
       req_id_(plan.req_id()),
@@ -665,26 +672,55 @@ void ReshardReceiveSession::FinishPoolH2d(KVCacheManagerWithTransfer& manager,
   if (!finished && status.ok()) {
     ExecuteEligiblePoolH2ds(manager);
   }
+  if (!finished) return;
+  if (status.ok() && recv_nan_check_ && TryBeginRecvOp()) {
+    // Hold a receive operation across the queued check, bool readback, and
+    // any admitted dump. In particular, network_completed_ stays false so a
+    // polling reader cannot publish completion while diagnostics use HBM.
+    recv_nan_check_->Schedule([self = shared_from_this()] {
+      if (!self->IsDraining()) {
+        try {
+          self->recv_nan_check_->Run();
+        } catch (const std::exception& e) {
+          LOG(WARNING) << "Receive FA KV NaN check unavailable: req_id="
+                       << self->req_id_ << " uuid=" << self->uuid_
+                       << " exception=" << e.what();
+        } catch (...) {
+          LOG(WARNING) << "Receive FA KV NaN check unavailable: req_id="
+                       << self->req_id_ << " uuid=" << self->uuid_
+                       << " unknown exception";
+        }
+      }
+      self->FinishReceive(absl::OkStatus());
+      // This is the last access to session-owned manager resources. The
+      // manager's poll/teardown path retires the settled plan; do not touch
+      // the manager after EndRecvOp wakes its destructor's drain wait.
+      self->EndRecvOp();
+    });
+    return;
+  }
+  FinishReceive(status);
+}
+
+void ReshardReceiveSession::FinishReceive(const absl::Status& status) {
   std::chrono::steady_clock::time_point session_start_time;
   bool should_record_duration = false;
-  if (finished) {
-    // The plan stays registered until the receive settles (every upload and
-    // every admitted push ended); the settle path drops it through
-    // unregister_on_settle_, so a plan never outlives its staging or gets
-    // torn down under a push still resolving through it.
-    absl::Status terminal_status = absl::OkStatus();
-    {
-      absl::MutexLock lock(mu_);
-      if (!status.ok()) {
-        terminal_status = status;
-      } else {
-        session_start_time = start_time_;
-        should_record_duration = true;
-        network_completed_ = true;
-      }
+  // The plan stays registered until the receive settles (every upload and
+  // every admitted push ended); the settle path drops it through
+  // unregister_on_settle_, so a plan never outlives its staging or gets
+  // torn down under a push still resolving through it.
+  absl::Status terminal_status = absl::OkStatus();
+  {
+    absl::MutexLock lock(mu_);
+    if (!status.ok()) {
+      terminal_status = status;
+    } else {
+      session_start_time = start_time_;
+      should_record_duration = true;
+      network_completed_ = true;
     }
-    Finish(terminal_status);
   }
+  Finish(terminal_status);
   if (should_record_duration) {
     RecordTransferDuration(
         DurationMs(session_start_time, std::chrono::steady_clock::now()));
