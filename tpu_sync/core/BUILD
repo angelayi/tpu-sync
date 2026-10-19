@@ -667,6 +667,7 @@ cc_library(
     hdrs = [
         "data_connection_policy.h",
         "kv_cache_manager_with_transfer.h",
+        "nan_log_level.h",
         "recv_nan_check.h",
         "recv_nan_check_worker.h",
         "reshard_receive_session.h",
@@ -1079,6 +1080,16 @@ cc_test(
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
     ],
+)
+
+cc_test(
+    name = "nan_log_level_test",
+    size = "small",
+    srcs = [
+        "nan_log_level.h",
+        "nan_log_level_test.cc",
+    ],
+    deps = ["@com_google_googletest//:gtest_main"],
 )
 
 cc_test(

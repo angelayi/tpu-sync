@@ -105,7 +105,7 @@ class RecvNanCheck {
     std::function<bool()> Submit();
     std::unique_ptr<Impl> impl_;
   };
-  static std::shared_ptr<Task> CreateIfEnabled(
+  static std::shared_ptr<Task> Create(
       kv_cache::KVCacheManagerBase* base,
       const ::tpu_sync::rpc::StartTransferRequest& plan,
       std::shared_ptr<RecvNanCheck>* manager_owner);

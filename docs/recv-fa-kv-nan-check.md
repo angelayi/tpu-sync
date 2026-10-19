@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-`TPU_RAIDEN_CHECK_RECV_FA_NAN=1` 开启接收端诊断：pool-reshard receive 的全部 H2D 完成后，使用 native PJRT 在 TPU 上检查本次接收的 FA、GDN conv/SSM 有效范围，只回读每个 pool/shard 的布尔结果。所有设备的检查和异步回读提交后即报告接收完成；不等待检查执行、bool 到达 host 或日志输出。检查必须先于本次 forward 提交，并依赖接收进程的设备同流执行顺序。默认关闭，不进入诊断路径。
+`TPU_NAN_LOG_LEVEL=3`（`DUMP`）或 `4`（`ALL`）开启接收端诊断：pool-reshard receive 的全部 H2D 完成后，使用 native PJRT 在 TPU 上检查本次接收的 FA、GDN conv/SSM 有效范围，只回读每个 pool/shard 的布尔结果。所有设备的检查和异步回读提交后即报告接收完成；不等待检查执行、bool 到达 host 或日志输出。检查必须先于本次 forward 提交，并依赖接收进程的设备同流执行顺序。默认 `0`，不进入诊断路径。
 
 每个 manager 的每层/pool 按每 100 次成功完成的接收检查划分窗口，包括正常结果。每个窗口仅前 3 次 NaN/Inf 命中输出异常 tensor 的定位日志；其余命中只做 TPU 检查和布尔回读。此版本不回读或输出 KV 数值，不创建 KV 快照。第 101、201……次检查开始新窗口；重建 manager 后计数重置。
 
@@ -11,10 +11,23 @@
 在 **decode/接收进程** 设置：
 
 ```bash
-export TPU_RAIDEN_CHECK_RECV_FA_NAN=1
+export TPU_NAN_LOG_LEVEL=3
 ```
 
-只有值恰好为 `1` 才开启。发送端、普通非 pool-reshard receive 不受影响。每次创建接收 session 时读取开关。
+这是与 vllm-torchtpu 共用的累计诊断等级，两个包均需升级到支持该协议的版本：
+
+| 枚举 | 值 | 累计启用的诊断 |
+| --- | --- | --- |
+| `OFF` | 0 | 全部关闭 |
+| `SUMMARY` | 1 | vllm-torchtpu 最后 hidden / logits 检查与异常轮数指标 |
+| `DETAIL` | 2 | 加上逐层 hidden 检查与现有现场快照 |
+| `DUMP` | 3 | 加上本接收 FA/GDN KV 检查与限频定位日志 |
+| `ALL` | 4 | 加上 Decode batch 逐层 KV cache 检查 |
+
+只接受单个数字 `0`–`4`，未设置为 `0`，其他值在接收 session 创建入口返回 `InvalidArgument` 配置错误。
+native 在创建接收 session 时读取；部署时统一在所有 worker 启动前设置，修改后重启进程。
+旧 `TPU_RAIDEN_CHECK_RECV_FA_NAN` 不再读取。发送端、普通非 pool-reshard receive 不受影响。
+`check_nan_on_save` 保持独立，各诊断原有采样、限频和能力边界不变。
 
 检查 tag 为 `fa`、`fa.l<十进制层号>`、`gdn.conv` 或 `gdn.ssm` 的 pool；GDN 还接受 `.g<十进制组号>` 和 `.l<十进制层号>` 后缀，组号在层号之前。dtype 必须明确是 `bfloat16`/`bf16`、`float16`/`f16` 或 `float32`/`f32`。FP8、整数 carrier、未知 dtype 跳过，不按字节猜测格式。GDN 必须使用逻辑 conv/SSM pool 的真实 dtype，而非承载整页的 raw Tensor dtype。BF16、FP32 可共用同一 backing allocation。正负 Inf 和 NaN 均视为异常。
 
@@ -36,7 +49,7 @@ TPU 程序按原始 U32 字节布局进行位分类及布尔归约，直接借�
 
 每次真实编译输出 `Receive KV diagnostic compile`，记录 key hash、完整签名、cache size/eviction、逻辑 pool/storage/扫描组数量、metadata rows 和编译耗时。`VLOG(1)` 另外记录 queue、metadata 准备/上传和 layout、Execute/回读提交分段耗时；这些是 host 提交耗时，不等同于 TPU 设备执行时间。编译及全部设备提交仍先于接收完成回调。
 
-Torch 在构造 manager 时为已有 `TensorBufferHandle` owner 注册弱引用。首次开启且存在可检查 pool 时，诊断对象提升为强引用，覆盖后续任务、设备操作和执行器 Drain；关闭时不创建诊断线程或编译程序，原 buffer 的释放时点保持。每个 session 读取开关，支持先关闭再开启。要求静态 PJRT C API buffer 和已注册的 typed buffer owner；raw-pointer-only frontend、Common client 和动态 shape 不进入设备诊断。不支持配置或执行错误记录诊断不可用，传输本身不因诊断失败而报错，也不退回 CPU 全量扫描。
+Torch 在构造 manager 时为已有 `TensorBufferHandle` owner 注册弱引用。首次开启且存在可检查 pool 时，诊断对象提升为强引用，覆盖后续任务、设备操作和执行器 Drain；关闭时不创建诊断线程或编译程序，原 buffer 的释放时点保持。每个 session 读取等级。要求静态 PJRT C API buffer 和已注册的 typed buffer owner；raw-pointer-only frontend、Common client 和动态 shape 不进入设备诊断。不支持配置或执行错误记录诊断不可用，传输本身不因诊断失败而报错，也不退回 CPU 全量扫描。
 
 ## 异常 tensor 定位日志
 
@@ -49,3 +62,18 @@ NaN/Inf detected in received KV cache: req_id=... uuid=... pool=... tag=gdn.ssm.
 `shards` 只列实际命中的 shard；tag 标识 FA 或 GDN conv/SSM 及其组/层。任一 shard 命中只占一次该 pool 的日志额度。正常结果和超出额度的 NaN/Inf 不输出此日志。GDN conv 与 SSM 是独立逻辑 pool，各自计数。
 
 这是本次有效接收范围的 bool 结果，不包含首个 NaN/Inf 偏移、具体异常 block 或 KV 数值。不在 bool 到达后重读原 HBM，因此即使 forward 已更新 GDN state，定位结果仍对应此前提交的接收检查。关闭功能时不创建线程、程序或 pending 资源。
+
+## 配置契约验证
+
+准备好项目固定的 TorchTPU / XLA 依赖和 Bazel 工具链后运行：
+
+```bash
+bazel test --config=oss \
+  //tpu_sync/core:nan_log_level_test \
+  //tpu_sync/core:recv_nan_check_test \
+  //tpu_sync/core:reshard_receive_session_test
+```
+
+等级测试覆盖默认关闭、五级数值协议和非法值；session 入口测试验证非法等级返回
+`InvalidArgument`，以及无诊断 owner 时保留原有入口行为。它们不替代 TPU 设备执行、
+接收异步生命周期和真实模型验收。
