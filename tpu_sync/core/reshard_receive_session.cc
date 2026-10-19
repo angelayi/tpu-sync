@@ -40,6 +40,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
 #include "tpu_sync/core/kv_cache_manager_with_transfer.h"
+#include "tpu_sync/core/nan_log_level.h"
 #include "tpu_sync/core/raw_transfer_core.h"
 #include "tpu_sync/core/utils.h"
 #include "tpu_sync/kv_cache/kv_cache_manager_base.h"
@@ -357,6 +358,12 @@ ReshardReceiveSession::Create(
     absl::Span<const int64_t> chip_blocks,
     std::chrono::steady_clock::time_point deadline,
     std::shared_ptr<RecvNanCheck>* diagnostic_owner) {
+  const auto nan_level =
+      diagnostic_owner == nullptr ? NanLogLevel::kOff : GetNanLogLevel();
+  if (!nan_level) {
+    return absl::InvalidArgumentError(
+        "Invalid TPU_NAN_LOG_LEVEL: expected 0, 1, 2, 3 or 4");
+  }
   if (staging_allocator == nullptr) {
     return absl::InvalidArgumentError("staging_allocator must not be null");
   }
@@ -375,9 +382,9 @@ ReshardReceiveSession::Create(
   auto session =
       std::shared_ptr<ReshardReceiveSession>(new ReshardReceiveSession(
           base, staging_allocator, plan.uuid(), plan, chip_blocks, deadline,
-          diagnostic_owner == nullptr
+          *nan_level < NanLogLevel::kDump
               ? nullptr
-              : RecvNanCheck::CreateIfEnabled(base, plan, diagnostic_owner)));
+              : RecvNanCheck::Create(base, plan, diagnostic_owner)));
   TF_RETURN_IF_ERROR(session->AcquireStagingLeases(plan));
   return session;
 }

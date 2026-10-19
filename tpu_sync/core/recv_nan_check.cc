@@ -8,7 +8,6 @@
 #include <cassert>
 #include <cmath>
 #include <condition_variable>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <initializer_list>
@@ -477,12 +476,10 @@ void RecvNanCheck::Task::Schedule(std::function<void()> completion) {
   impl_->owner->impl_->Schedule(std::move(completion));
 }
 
-std::unique_ptr<RecvNanCheck::Task> RecvNanCheck::CreateIfEnabled(
+std::unique_ptr<RecvNanCheck::Task> RecvNanCheck::Create(
     kv_cache::KVCacheManagerBase* base,
     const ::tpu_sync::rpc::StartTransferRequest& plan,
     std::shared_ptr<RecvNanCheck>* manager_owner) {
-  const char* enabled = std::getenv("TPU_RAIDEN_CHECK_RECV_FA_NAN");
-  if (enabled == nullptr || std::string_view(enabled) != "1") return nullptr;
   auto task = std::make_unique<Task::Impl>();
   task->uuid = plan.uuid();
   task->req = plan.req_id();
