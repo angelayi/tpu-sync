@@ -108,15 +108,6 @@ class CustomTestBackend : public KVCacheStoreBackend {
     }
     return true;
   }
-  bool InsertAndLock(absl::Span<const std::string> hashes,
-                     absl::Span<const RaidenBlockId> slices, bool) override {
-    for (size_t i = 0; i < hashes.size() && i < slices.size(); ++i) {
-      entries_[hashes[i]] = slices[i];
-      ++pin_counts_[hashes[i]];
-    }
-    return true;
-  }
-  size_t ReleaseAndDelete(absl::Span<const std::string>) override { return 0; }
   void Delete(absl::Span<const std::string>,
               absl::Span<const RaidenBlockId>) override {}
   bool Pin(absl::Span<const std::string> hashes) override {
@@ -273,6 +264,9 @@ TEST(KVCacheStoreBackendFactoryTest, CustomBackendDefaultHostOffloadHooks) {
   TF_ASSERT_OK_AND_ASSIGN(auto backend,
                           KVCacheStoreBackendFactory::Create(config));
   EXPECT_EQ(backend->name(), "CustomTestBackend");
+
+  EXPECT_FALSE(
+      backend->Insert({"h1"}, {RaidenBlockId()}, InsertOption::kAdmitStrict));
 
   BlockTracker save_tracker;
   EXPECT_THAT(

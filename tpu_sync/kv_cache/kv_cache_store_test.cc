@@ -3802,7 +3802,7 @@ TEST(KVCacheStoreTest, MultiBackendLocalLookupWhenGlobalDisabled) {
   EXPECT_EQ((*ungated_res)[1].first, "h2");
 }
 
-TEST(KVCacheStoreTest, MultiBackendInsertAndLockRollback) {
+TEST(KVCacheStoreTest, MultiBackendInsertTargetsPrimaryBackendOnly) {
   auto b1 = std::make_shared<TestHostOffloadBackend>(/*capacity=*/2);
   auto b2 = std::make_shared<TestHostOffloadBackend>(/*capacity=*/1);
 
@@ -3818,17 +3818,16 @@ TEST(KVCacheStoreTest, MultiBackendInsertAndLockRollback) {
       RaidenBlockId(id, /*host_block_id=*/-1, /*device_block_id=*/2,
                     BlockStatus::HBM)};
 
-  // b1 capacity=2 supports 2 blocks, but b2 capacity=1 fails on 2 blocks.
+  // KVCacheStore::Insert indexes and pins LOCAL blocks on tier 0 (b1) only;
+  // secondary backends (b2, capacity=1) are not touched during Insert.
   absl::Status status = store.Insert(hashes, slices, /*on_host=*/true);
-  EXPECT_TRUE(absl::IsResourceExhausted(status)) << status;
+  ABSL_ASSERT_OK(status);
 
-  // Verify rollback on b1: no locks or entries remain.
-  EXPECT_EQ(b1->GetSize(), 0);
-  EXPECT_EQ(b1->GetPinCount("h1"), 0);
-  EXPECT_EQ(b1->GetPinCount("h2"), 0);
+  EXPECT_EQ(b1->GetSize(), 2);
+  EXPECT_EQ(b1->GetPinCount("h1"), 1);
+  EXPECT_EQ(b1->GetPinCount("h2"), 1);
   EXPECT_EQ(b2->GetSize(), 0);
 }
-
 
 using ::testing::EndsWith;
 using ::testing::Not;
@@ -4811,9 +4810,11 @@ TEST_F(RemoteWriteSourceTest, AllExistSettlesDoneWithoutATransfer) {
   auto dst_store = MakeStore(dst);
   RegisterWorker(*src_store);
   Populate(*src_store, src, {"a", "b"});
-  ASSERT_TRUE(dst_store->backend()->InsertAllOrNothing(
-      {"a", "b"}, {RaidenBlockId(dst, 5, BlockStatus::HOST),
-                   RaidenBlockId(dst, 6, BlockStatus::HOST)}));
+  ASSERT_TRUE(
+      dst_store->backend()->Insert({"a", "b"},
+                                   {RaidenBlockId(dst, 5, BlockStatus::HOST),
+                                    RaidenBlockId(dst, 6, BlockStatus::HOST)},
+                                   InsertOption::kAdmitStrict));
 
   ABSL_ASSERT_OK(src_store->Save({"a", "b"}, dst));
 
@@ -4834,8 +4835,9 @@ TEST_F(RemoteWriteSourceTest, PartialExistIsReportedAndNotRetried) {
   auto dst_store = MakeStore(dst);
   RegisterWorker(*src_store);
   Populate(*src_store, src, {"a", "b"});
-  ASSERT_TRUE(dst_store->backend()->InsertAllOrNothing(
-      {"a"}, {RaidenBlockId(dst, 5, BlockStatus::HOST)}));
+  ASSERT_TRUE(dst_store->backend()->Insert(
+      {"a"}, {RaidenBlockId(dst, 5, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
 
   ABSL_ASSERT_OK(src_store->Save({"a", "b"}, dst));
 
@@ -6131,14 +6133,6 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override {
     return false;
-  }
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override {
-    return false;
-  }
-  size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override {
-    return 0;
   }
   void Delete(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices) override {}

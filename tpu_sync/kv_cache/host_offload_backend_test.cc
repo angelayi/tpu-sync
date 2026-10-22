@@ -323,20 +323,23 @@ TEST(HostOffloadBackendTest, InsertAndLockRollbackOnCapacityExceeded) {
       RaidenBlockId(id, 11, BlockStatus::HOST),
       RaidenBlockId(id, 12, BlockStatus::HOST)};
 
-  // InsertAndLock for 3 items on capacity=2 must fail and rollback
-  bool success = backend.InsertAndLock(hashes, slices, /*on_host=*/true);
+  // Insert(kInsertAndPin) for 3 items on capacity=2 must fail and rollback
+  bool success = backend.Insert(hashes, slices, InsertOption::kInsertAndPin);
   EXPECT_FALSE(success);
   EXPECT_EQ(backend.GetSize(), 0);
 
-  // Partial InsertAndLock up to capacity works
+  // Partial Insert(kInsertAndPin) up to capacity works
   std::vector<std::string> sub_hashes = {"h1", "h2"};
   std::vector<RaidenBlockId> sub_slices = {slices[0], slices[1]};
-  EXPECT_TRUE(backend.InsertAndLock(sub_hashes, sub_slices, /*on_host=*/true));
+  EXPECT_TRUE(
+      backend.Insert(sub_hashes, sub_slices, InsertOption::kInsertAndPin));
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
   EXPECT_EQ(backend.GetPinCount("h2"), 1);
 
-  // Attempt to InsertAndLock h3 should fail because available_space() is 0
-  EXPECT_FALSE(backend.InsertAndLock({"h3"}, {slices[2]}, /*on_host=*/true));
+  // Attempt to Insert(kInsertAndPin) h3 should fail because available_space()
+  // is 0
+  EXPECT_FALSE(
+      backend.Insert({"h3"}, {slices[2]}, InsertOption::kInsertAndPin));
   EXPECT_EQ(backend.GetPinCount("h1"), 1);
   EXPECT_EQ(backend.GetPinCount("h2"), 1);
 }
@@ -350,12 +353,12 @@ TEST(HostOffloadBackendTest, InsertAndLockRebindsStaleHbmEntry) {
 
   RaidenBlockId first(id, /*host_block_id=*/-1, /*device_block_id=*/7,
                       BlockStatus::HBM);
-  ASSERT_TRUE(backend.InsertAndLock({"h1"}, {first}, /*on_host=*/false));
+  ASSERT_TRUE(backend.Insert({"h1"}, {first}, InsertOption::kInsertAndPin));
   backend.Release({"h1"});
 
   RaidenBlockId second(id, /*host_block_id=*/-1, /*device_block_id=*/9,
                        BlockStatus::HBM);
-  ASSERT_TRUE(backend.InsertAndLock({"h1"}, {second}, /*on_host=*/false));
+  ASSERT_TRUE(backend.Insert({"h1"}, {second}, InsertOption::kInsertAndPin));
 
   TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"h1"}));
   ASSERT_EQ(lookup_res.size(), 1);
@@ -370,12 +373,12 @@ TEST(HostOffloadBackendTest, InsertAndLockKeepsHostResidentEntry) {
   RaidenId id{"job", "0", "data", 0};
 
   RaidenBlockId resident(id, /*host_block_id=*/3, BlockStatus::HOST);
-  ASSERT_TRUE(backend.InsertAndLock({"h1"}, {resident}, /*on_host=*/true));
+  ASSERT_TRUE(backend.Insert({"h1"}, {resident}, InsertOption::kInsertAndPin));
   backend.Release({"h1"});
 
   RaidenBlockId reoffer(id, /*host_block_id=*/-1, /*device_block_id=*/9,
                         BlockStatus::HBM);
-  ASSERT_TRUE(backend.InsertAndLock({"h1"}, {reoffer}, /*on_host=*/false));
+  ASSERT_TRUE(backend.Insert({"h1"}, {reoffer}, InsertOption::kInsertAndPin));
 
   TF_ASSERT_OK_AND_ASSIGN(auto lookup_res, backend.Lookup({"h1"}));
   ASSERT_EQ(lookup_res.size(), 1);
@@ -1175,9 +1178,10 @@ TEST(HostOffloadBackendWriteRemoteTest,
   HostOffloadBackendTest::Backend backend(/*capacity=*/8);
   RaidenId id{"job", "0", "data", 0};
 
-  EXPECT_TRUE(backend.InsertAllOrNothing(
-      {"a", "b"}, {RaidenBlockId(id, 1, BlockStatus::HOST),
-                   RaidenBlockId(id, 2, BlockStatus::HOST)}));
+  EXPECT_TRUE(backend.Insert({"a", "b"},
+                             {RaidenBlockId(id, 1, BlockStatus::HOST),
+                              RaidenBlockId(id, 2, BlockStatus::HOST)},
+                             InsertOption::kAdmitStrict));
   EXPECT_EQ(backend.GetSize(), 2);
   TF_ASSERT_OK_AND_ASSIGN(
       auto present,
@@ -1186,8 +1190,8 @@ TEST(HostOffloadBackendWriteRemoteTest,
               UnorderedElementsAre(::testing::Key("a"), ::testing::Key("b")));
 }
 
-// The whole point of the primitive: one duplicate refuses the batch. Insert()
-// would instead rebind the duplicate in place and report partial success,
+// The whole point of kAdmitStrict: one duplicate refuses the batch.
+// kBestEffortUpdate would instead rebind the duplicate in place and succeed,
 // which for a remote write orphans the old host block and lets the source
 // free blocks the destination does not have.
 TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
@@ -1195,9 +1199,10 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
   RaidenId id{"job", "0", "data", 0};
   backend.Insert({"a"}, {RaidenBlockId(id, 1, BlockStatus::HOST)});
 
-  EXPECT_FALSE(backend.InsertAllOrNothing(
-      {"b", "a"}, {RaidenBlockId(id, 2, BlockStatus::HOST),
-                   RaidenBlockId(id, 3, BlockStatus::HOST)}));
+  EXPECT_FALSE(backend.Insert({"b", "a"},
+                              {RaidenBlockId(id, 2, BlockStatus::HOST),
+                               RaidenBlockId(id, 3, BlockStatus::HOST)},
+                              InsertOption::kAdmitStrict));
   // "b" must not have landed: nothing, not almost-everything.
   TF_ASSERT_OK_AND_ASSIGN(
       auto present_b,
@@ -1211,13 +1216,13 @@ TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRefusesADuplicate) {
 TEST(HostOffloadBackendWriteRemoteTest, InsertAllOrNothingRespectsPinnedSpace) {
   HostOffloadBackendTest::Backend backend(/*capacity=*/2);
   RaidenId id{"job", "0", "data", 0};
-  ASSERT_TRUE(backend.InsertAndLock({"pinned_a", "pinned_b"},
-                                    {RaidenBlockId(id, 1, BlockStatus::HOST),
-                                     RaidenBlockId(id, 2, BlockStatus::HOST)},
-                                    /*on_host=*/true));
+  ASSERT_TRUE(backend.Insert({"pinned_a", "pinned_b"},
+                             {RaidenBlockId(id, 1, BlockStatus::HOST),
+                              RaidenBlockId(id, 2, BlockStatus::HOST)},
+                             InsertOption::kInsertAndPin));
 
-  EXPECT_FALSE(backend.InsertAllOrNothing(
-      {"c"}, {RaidenBlockId(id, 3, BlockStatus::HOST)}));
+  EXPECT_FALSE(backend.Insert({"c"}, {RaidenBlockId(id, 3, BlockStatus::HOST)},
+                              InsertOption::kAdmitStrict));
 }
 
 TEST(HostOffloadBackendWriteRemoteTest,

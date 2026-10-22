@@ -936,7 +936,7 @@ KVCacheStoreServiceImpl::CompleteWriteRemote(uint64_t op_id,
   for (int32_t block_id : op->landing_block_ids) {
     slices.push_back(RaidenBlockId(local_id, block_id, BlockStatus::HOST));
   }
-  if (!backend_->InsertAllOrNothing(op->block_hashes, slices)) {
+  if (!backend_->Insert(op->block_hashes, slices, InsertOption::kAdmitStrict)) {
     Finish(op, OpState::kFailed, {});
     return std::nullopt;
   }
