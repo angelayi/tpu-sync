@@ -69,15 +69,9 @@ class HostOffloadBackend : public KVCacheStoreBackend {
       absl::Span<const std::string> block_hashes,
       const LookupOptions& options = {}) override;
 
-  std::pair<bool, BlockSliceList> Insert(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) override;
-
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override;
-
-  size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override;
+  bool Insert(absl::Span<const std::string> block_hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override;
 
   void Delete(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices) override;
@@ -118,9 +112,6 @@ class HostOffloadBackend : public KVCacheStoreBackend {
                      BlockTracker* absl_nonnull save_tracker) override;
 
   // --- WriteRemote & registry overrides ------------------------------------
-  bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
-                          absl::Span<const RaidenBlockId> slices) override;
-
   tsl::Future<> RegisterBlocksAsync(
       absl::Span<const std::string> block_hashes,
       absl::Span<const int32_t> host_block_ids) override;

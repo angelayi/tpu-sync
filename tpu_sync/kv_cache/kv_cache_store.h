@@ -278,29 +278,12 @@ class KVCacheStore {
       const std::vector<std::string>& block_hashes,
       const LookupOptions& options);
 
-  // Caches sharded buffers into host-RAM/HBM backing store, PINNING every
-  // hash it takes: existing ones are pinned in place, new ones inserted and
-  // pinned. New items are inserted in reverse order so that tail blocks are
-  // evicted first.
-  //
-  // All-or-nothing. It does NOT evict to make room: if there is not enough
-  // free space for the new hashes it unpins whatever it already pinned and
-  // returns false, leaving the cache exactly as it found it. Making room by
-  // evicting is the store's own business, not something an insert does on the
-  // caller's behalf.
-  //
-  // PIN CONTRACT: the pin it grants is what a subsequent Save() consumes.
-  // Called with hashes Lookup() reported as misses -- the two take disjoint
-  // sets, which is why no hash ends up pinned twice.
-  //
-  // LOCAL entries only. The LRU cache holds blocks resident on THIS node;
-  // a REMOTE slice names a block on another node and has no business in it.
-  // If any slice in the batch has status REMOTE the whole batch is refused
-  // with InvalidArgument and nothing is inserted or pinned.
-  //
-  // Returns OkStatus when the whole operation succeeded, InvalidArgument for
-  // a REMOTE slice in the batch, and ResourceExhausted when the cache refused
-  // the batch (not enough unpinned space, or a hash could not be pinned).
+  // Atomically inserts and pins LOCAL blocks in the primary backend
+  // (`backends_[0]`) via `InsertOption::kInsertAndPin`.
+  // Returns `InvalidArgumentError` if any slice has status `REMOTE`, or
+  // `ResourceExhaustedError` without modifying the backend if unpinned
+  // capacity is insufficient. `on_host` is unused; residency is specified per
+  // block in `RaidenBlockId::status`.
   absl::Status Insert(const std::vector<std::string>& block_hashes,
                       const std::vector<RaidenBlockId>& slices, bool on_host);
 
@@ -754,20 +737,12 @@ class KVCacheStore {
   absl::StatusOr<std::vector<int>> AllocateBlockIds(int needed);
   void DeallocateBlockIds(absl::Span<const int> block_ids);
 
-  // Recalls `block_hashes` from the secondary storage tier (backends_[1]) into
-  // HBM at `device_block_ids`. Everything storage-specific happens here: the
-  // caller has validated the batch, checked that a secondary backend exists
-  // and marked `block_hashes` pending; this allocates the host staging blocks
-  // and issues an asynchronous RECALL transfer through the RaidenController.
-  // On completion, the callback admits the recalled blocks into the host-RAM
-  // tier's LRU (returning any staging block the tier refuses), frees the
-  // staging blocks on failure, and marks the blocks done or failed in
-  // load_tracker_.
-  //
-  // Every outcome, including failure to allocate staging blocks, is reported
-  // per hash through load_tracker_ only -- the same way the peer path reports
-  // its own staging failure -- so a failure is reported exactly once. Must be
-  // called without mutex_ held (AllocateBlockIds takes it).
+  // Asynchronously recalls `block_hashes` from the secondary storage backend
+  // (`backends_[1]`) into `device_block_ids` via host staging blocks. On
+  // success, admits each block into `backends_[0]` as an unpinned
+  // `HOST_AND_HBM` entry via `InsertOption::kAdmitStrict` (freeing any refused
+  // staging block). Reports completion or failure through `load_tracker_`.
+  // Must be called without `mutex_` held.
   void LoadFromSecondaryBackend(absl::Span<const std::string> block_hashes,
                                 absl::Span<const int> device_block_ids);
 

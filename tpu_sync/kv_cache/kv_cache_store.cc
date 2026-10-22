@@ -1016,13 +1016,12 @@ absl::StatusOr<BlockSliceList> KVCacheStore::Lookup(
 
 absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
                                   const std::vector<RaidenBlockId>& slices,
-                                  bool on_host) {
-  if (backends_.empty()) {
+                                  bool /*on_host*/) {
+  if (backends_.empty() || !backends_[0]) {
     return absl::FailedPreconditionError("KVCacheStore has no backend");
   }
 
-  // The LRU cache holds LOCAL blocks only; refuse the whole batch before any
-  // backend is touched, so a bad batch cannot pin or insert anything.
+  // Reject REMOTE slices before modifying the backend.
   for (size_t i = 0; i < slices.size(); ++i) {
     if (slices[i].status == BlockStatus::REMOTE) {
       return absl::InvalidArgumentError(absl::StrCat(
@@ -1033,18 +1032,11 @@ absl::Status KVCacheStore::Insert(const std::vector<std::string>& block_hashes,
     }
   }
 
-  std::vector<size_t> locked_backends;
-  for (size_t i = 0; i < backends_.size(); ++i) {
-    if (!backends_[i]) continue;
-    if (!backends_[i]->InsertAndLock(block_hashes, slices, on_host)) {
-      for (size_t lb : locked_backends) {
-        backends_[lb]->ReleaseAndDelete(block_hashes);
-      }
-      return absl::ResourceExhaustedError(
-          "Insert refused: not enough unpinned space, or a hash could not be "
-          "pinned");
-    }
-    locked_backends.push_back(i);
+  if (!backends_[0]->Insert(block_hashes, slices,
+                            InsertOption::kInsertAndPin)) {
+    return absl::ResourceExhaustedError(
+        "Insert refused: not enough unpinned space, or a hash could not be "
+        "pinned");
   }
   return absl::OkStatus();
 }
@@ -1185,8 +1177,7 @@ absl::Status KVCacheStore::SaveLocal(
         update_slices.push_back(block);
       }
       if (!update_hashes.empty() && host_ram_backend != nullptr) {
-        host_ram_backend->Insert(update_hashes, update_slices,
-                                 /*on_host=*/true);
+        host_ram_backend->Insert(update_hashes, update_slices);
       }
       {
         absl::MutexLock lock(lifetime->mu);
@@ -1468,54 +1459,29 @@ void KVCacheStore::LoadFromSecondaryBackend(
           }
           return;
         }
-        // Storage recall succeeded: the transfer has already written every
-        // block into HBM. The recalled bytes are also still in the host
-        // staging blocks, so each block is then published into the host-RAM
-        // tier -- backends_[0], the HostOffloadBackend -- by inserting a
-        // HOST_AND_HBM entry owned by this store into its LRU cache
-        // (InsertAllOrNothing below). That LRU cache is what Lookup() consults
-        // for local HOST hits. Publishing is a caching optimization and may
-        // fail without failing the Load. host_ram_backend is never null (see
-        // the DCHECK at entry).
-
+        // Publish recalled blocks into the primary host-RAM backend
+        // (`backends_[0]`) as unpinned HOST_AND_HBM entries owned by this
+        // store.
         std::vector<std::string> update_hashes;
         std::vector<RaidenBlockId> update_slices;
         update_hashes.reserve(block_hashes.size());
         update_slices.reserve(block_hashes.size());
         for (size_t i = 0; i < block_hashes.size(); ++i) {
-          // Publish recalled blocks under this store's own ID so subsequent
-          // lookups recognize them as local host/device resident.
           update_hashes.push_back(block_hashes[i]);
           update_slices.emplace_back(raiden_id, staging_host_block_ids[i],
                                      device_block_ids[i],
                                      BlockStatus::HOST_AND_HBM);
         }
 
-        // TODO: revisit whether recall-admitted entries should be pinned. Left
-        // unpinned because there is no natural unpin owner on this path --
-        // offload has Release, recall has nothing equivalent -- which means the
-        // very next AllocateBlockIds may evict what we just admitted. Decide
-        // alongside the recall reservation work.
-        //
-        // Admission is done per-block rather than as a single batch because
-        // refusal is per-block (e.g. duplicate hashes from a concurrent
-        // publisher). Admitting one-by-one preserves the usable prefix chain
-        // even if later blocks collide. Single-element InsertAllOrNothing
-        // validates, inserts, and verifies under the backend's own mutex.
-        // InsertAllOrNothing rather than Insert: Insert cannot report a
-        // refusal -- its all_inserted flag is cleared only when a hash was
-        // already present, never when LRUCache::Put silently drops a new key --
-        // so a refused staging block would go undetected and leak.
+        // Admit recalled blocks one by one without pinning (`kAdmitStrict`);
+        // fails per block if the hash is already present or unpinned space is
+        // full.
         std::vector<int> to_return;
         for (size_t i = 0; i < update_hashes.size(); ++i) {
-          if (!host_ram_backend->InsertAllOrNothing({update_hashes[i]},
-                                                    {update_slices[i]})) {
-            // The host-RAM tier declined ownership of this block. Its physical
-            // block id must be returned HERE: block reclamation runs through
-            // KVCacheStore::Evict, which discovers victims by asking the tier
-            // for them, so a block with no LRU entry naming it is invisible to
-            // eviction and would stay allocated-and-locked for the life of the
-            // process.
+          if (!host_ram_backend->Insert({update_hashes[i]}, {update_slices[i]},
+                                        InsertOption::kAdmitStrict)) {
+            // Return staging blocks that were not admitted into the host-RAM
+            // cache.
             to_return.push_back(staging_host_block_ids[i]);
           }
         }

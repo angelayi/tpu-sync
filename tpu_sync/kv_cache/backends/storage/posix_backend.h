@@ -300,21 +300,14 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
     return tsl::Future<>(absl::OkStatus());
   }
 
-  std::pair<bool, BlockSliceList> Insert(
-      absl::Span<const std::string> block_hashes,
-      absl::Span<const RaidenBlockId> slices, bool on_host) override {
-    return {true, {}};
+  // No-op on the storage tier (blocks are written via async offload transfers).
+  // Returns false for kAdmitStrict, which applies only to host-RAM admission.
+  bool Insert(absl::Span<const std::string> block_hashes,
+              absl::Span<const RaidenBlockId> slices,
+              InsertOption option = InsertOption::kBestEffortUpdate) override {
+    return option != InsertOption::kAdmitStrict;
   }
 
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override {
-    return true;
-  }
-
-  size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override {
-    return 0;
-  }
   // Storage files are never removed through this tier. When the metadata
   // cache is enabled, this drops the cached shard keys of `block_hashes` so the
   // next Lookup re-probes storage; KVCacheStore calls it when a recall from

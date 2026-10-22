@@ -25,6 +25,7 @@
 
 #include "absl/base/nullability.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
@@ -345,184 +346,190 @@ absl::StatusOr<BlockSliceList> HostOffloadBackend::Lookup(
   return results;
 }
 
-std::pair<bool, BlockSliceList> HostOffloadBackend::Insert(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
-  BlockSliceList evicted_entries;
-  bool all_inserted = true;
-  std::shared_ptr<global_registry::GlobalRegistryClient> client;
-  RaidenId local_id;
+bool HostOffloadBackend::Insert(absl::Span<const std::string> block_hashes,
+                                absl::Span<const RaidenBlockId> slices,
+                                InsertOption option) {
+  switch (option) {
+    case InsertOption::kBestEffortUpdate: {
+      std::vector<std::string> evicted_hashes;
+      std::shared_ptr<global_registry::GlobalRegistryClient> client;
+      RaidenId local_id;
 
-  {
-    absl::MutexLock lock(mutex_);
-    for (size_t i = 0; i < block_hashes.size(); ++i) {
-      const std::string& hash = block_hashes[i];
-      if (lru_cache_.Contains(hash)) {
-        all_inserted = false;
-        if (i < slices.size()) {
-          if (RaidenBlockId* existing = lru_cache_.PeekMutable(hash)) {
-            *existing = slices[i];
+      {
+        absl::MutexLock lock(mutex_);
+        for (size_t i = 0; i < block_hashes.size(); ++i) {
+          const std::string& hash = block_hashes[i];
+          if (lru_cache_.Contains(hash)) {
+            if (i < slices.size()) {
+              if (RaidenBlockId* existing = lru_cache_.PeekMutable(hash)) {
+                *existing = slices[i];
+                SetMetadataEntry(hash, slices[i]);
+              }
+            }
+            continue;
+          }
+          if (metadata_.has_value()) {
+            if (const RaidenBlockId* stale =
+                    lru_cache_.PeekIncludingCandidates(hash)) {
+              ClearMetadataEntry(*stale);
+            }
+          }
+          std::optional<std::pair<std::string, RaidenBlockId>> evicted;
+          if (i < slices.size()) {
+            evicted = lru_cache_.Put(hash, slices[i]);
             SetMetadataEntry(hash, slices[i]);
+          } else {
+            evicted = lru_cache_.Put(hash, RaidenBlockId());
+          }
+          if (evicted.has_value()) {
+            evicted_hashes.push_back(std::move(evicted->first));
           }
         }
-        continue;
+        client = registry_client_;
+        local_id = raiden_id_;
       }
-      if (metadata_.has_value()) {
-        if (const RaidenBlockId* stale =
-                lru_cache_.PeekIncludingCandidates(hash)) {
-          ClearMetadataEntry(*stale);
+
+      // Unregister entries displaced from the active LRU cache.
+      if (client != nullptr && !evicted_hashes.empty()) {
+        client
+            ->UnregisterAsync(evicted_hashes, local_id,
+                              global_registry::kUnwaitedMutationTimeout)
+            .OnReady([](absl::Status status) {
+              if (!status.ok()) {
+                LOG(WARNING)
+                    << "Global registry unregister for evicted blocks failed: "
+                    << status.message();
+              }
+            });
+      }
+
+      return true;
+    }
+
+    case InsertOption::kInsertAndPin: {
+      absl::MutexLock lock(mutex_);
+
+      std::vector<size_t> existing_indices;
+      std::vector<size_t> new_indices;
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        if (lru_cache_.Contains(block_hashes[i])) {
+          existing_indices.push_back(i);
+        } else {
+          new_indices.push_back(i);
         }
       }
-      std::optional<std::pair<std::string, RaidenBlockId>> evicted;
-      if (i < slices.size()) {
-        evicted = lru_cache_.Put(hash, slices[i]);
+
+      for (size_t idx = 0; idx < existing_indices.size(); ++idx) {
+        size_t i = existing_indices[idx];
+        if (!lru_cache_.Pin(block_hashes[i])) {
+          for (size_t j = 0; j < idx; ++j) {
+            lru_cache_.Unpin(block_hashes[existing_indices[j]]);
+          }
+          return false;
+        }
+        // Overwrite HBM-only entries with the new slice; preserve HOST and
+        // HOST_AND_HBM entries.
+        if (i < slices.size()) {
+          RaidenBlockId* existing = lru_cache_.PeekMutable(block_hashes[i]);
+          if (existing != nullptr && existing->status == BlockStatus::HBM) {
+            ClearMetadataEntry(*existing);
+            *existing = slices[i];
+            SetMetadataEntry(block_hashes[i], slices[i]);
+          }
+        }
+      }
+
+      if (lru_cache_.available_space() < new_indices.size()) {
+        for (size_t i : existing_indices) {
+          lru_cache_.Unpin(block_hashes[i]);
+        }
+        return false;
+      }
+
+      // Insert in reverse order so block_hashes[0] becomes MRU.
+      for (auto it = new_indices.rbegin(); it != new_indices.rend(); ++it) {
+        size_t i = *it;
+        const std::string& hash = block_hashes[i];
+        if (metadata_.has_value()) {
+          if (const RaidenBlockId* stale =
+                  lru_cache_.PeekIncludingCandidates(hash)) {
+            ClearMetadataEntry(*stale);
+          }
+        }
+        if (i < slices.size()) {
+          lru_cache_.Put(hash, slices[i]);
+          SetMetadataEntry(hash, slices[i]);
+        } else {
+          lru_cache_.Put(hash, RaidenBlockId());
+        }
+      }
+
+      for (size_t idx = 0; idx < new_indices.size(); ++idx) {
+        size_t i = new_indices[idx];
+        if (!lru_cache_.Pin(block_hashes[i])) {
+          for (size_t j = 0; j < idx; ++j) {
+            lru_cache_.Unpin(block_hashes[new_indices[j]]);
+          }
+          for (size_t j : existing_indices) {
+            lru_cache_.Unpin(block_hashes[j]);
+          }
+          for (size_t j : new_indices) {
+            if (const RaidenBlockId* val =
+                    lru_cache_.PeekIncludingCandidates(block_hashes[j])) {
+              ClearMetadataEntry(*val);
+            }
+            lru_cache_.Erase(block_hashes[j]);
+          }
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    case InsertOption::kAdmitStrict: {
+      if (block_hashes.empty() || block_hashes.size() != slices.size()) {
+        return false;
+      }
+      absl::MutexLock lock(mutex_);
+
+      // Reject duplicate keys (in batch, active, or eviction candidates) or
+      // insufficient unpinned space.
+      absl::flat_hash_set<absl::string_view> seen_in_batch;
+      seen_in_batch.reserve(block_hashes.size());
+      for (const auto& hash : block_hashes) {
+        if (!seen_in_batch.insert(hash).second ||
+            lru_cache_.PeekIncludingCandidates(hash) != nullptr) {
+          return false;
+        }
+      }
+      if (block_hashes.size() > lru_cache_.available_space()) {
+        return false;
+      }
+
+      // Insert all keys and roll back the batch if any insertion fails.
+      for (size_t i = 0; i < block_hashes.size(); ++i) {
+        const std::string& hash = block_hashes[i];
+        std::optional<std::pair<std::string, RaidenBlockId>> evicted =
+            lru_cache_.Put(hash, slices[i]);
+        if (lru_cache_.Peek(hash) == nullptr) {
+          LOG(ERROR) << "Insert(kAdmitStrict): LRUCache::Put inserted nothing "
+                        "for a validated hash; rolling the batch back";
+          for (size_t j = 0; j < i; ++j) {
+            ClearMetadataEntry(slices[j]);
+            lru_cache_.Erase(block_hashes[j]);
+          }
+          return false;
+        }
         SetMetadataEntry(hash, slices[i]);
-      } else {
-        evicted = lru_cache_.Put(hash, RaidenBlockId());
+        // Displaced entries move to eviction candidates and keep their host
+        // blocks.
+        (void)evicted;
       }
-      if (evicted.has_value()) {
-        evicted_entries.push_back(std::move(*evicted));
-      }
-    }
-    client = registry_client_;
-    local_id = raiden_id_;
-  }
-
-  // Withdraw only: a completed save publishes, this does not. What was evicted
-  // to make room is unreadable from now on, and nothing else retires it.
-  if (client != nullptr && !evicted_entries.empty()) {
-    std::vector<std::string> evicted_hashes;
-    evicted_hashes.reserve(evicted_entries.size());
-    for (const auto& [hash, block_id] : evicted_entries) {
-      evicted_hashes.push_back(hash);
-    }
-    client
-        ->UnregisterAsync(evicted_hashes, local_id,
-                          global_registry::kUnwaitedMutationTimeout)
-        .OnReady([](absl::Status status) {
-          if (!status.ok()) {
-            LOG(WARNING)
-                << "Global registry unregister for evicted blocks failed: "
-                << status.message();
-          }
-        });
-  }
-
-  return std::make_pair(all_inserted, std::move(evicted_entries));
-}
-
-bool HostOffloadBackend::InsertAndLock(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
-  absl::MutexLock lock(mutex_);
-
-  std::vector<size_t> existing_indices;
-  std::vector<size_t> new_indices;
-  for (size_t i = 0; i < block_hashes.size(); ++i) {
-    if (lru_cache_.Contains(block_hashes[i])) {
-      existing_indices.push_back(i);
-    } else {
-      new_indices.push_back(i);
+      return true;
     }
   }
-
-  for (size_t idx = 0; idx < existing_indices.size(); ++idx) {
-    size_t i = existing_indices[idx];
-    if (!lru_cache_.Pin(block_hashes[i])) {
-      for (size_t j = 0; j < idx; ++j) {
-        lru_cache_.Unpin(block_hashes[existing_indices[j]]);
-      }
-      return false;
-    }
-    // An entry that is only in HBM describes a device block and nothing else:
-    // no host bytes were ever written for it, so there is nothing here worth
-    // keeping. Its device block belongs to whoever is inserting now, and the
-    // one recorded earlier may since have been handed back and refilled with
-    // unrelated data -- a save driven from that stale id would copy the wrong
-    // bytes. Take the caller's binding, which is the only current one.
-    //
-    // HOST and HOST_AND_HBM entries are left alone: those DO hold host bytes,
-    // and the caller is re-offering a block the store already has.
-    if (i < slices.size()) {
-      RaidenBlockId* existing = lru_cache_.PeekMutable(block_hashes[i]);
-      if (existing != nullptr && existing->status == BlockStatus::HBM) {
-        ClearMetadataEntry(*existing);
-        *existing = slices[i];
-        SetMetadataEntry(block_hashes[i], slices[i]);
-      }
-    }
-  }
-
-  if (lru_cache_.available_space() < new_indices.size()) {
-    for (size_t i : existing_indices) {
-      lru_cache_.Unpin(block_hashes[i]);
-    }
-    return false;
-  }
-
-  for (auto it = new_indices.rbegin(); it != new_indices.rend(); ++it) {
-    size_t i = *it;
-    const std::string& hash = block_hashes[i];
-    if (metadata_.has_value()) {
-      if (const RaidenBlockId* stale =
-              lru_cache_.PeekIncludingCandidates(hash)) {
-        ClearMetadataEntry(*stale);
-      }
-    }
-    // Put's displaced entry is discarded: a displaced entry becomes an
-    // eviction candidate that still holds its host block, and GetEvictableKeys
-    // finds it there. Nothing puts a displaced entry back.
-    if (i < slices.size()) {
-      lru_cache_.Put(hash, slices[i]);
-      SetMetadataEntry(hash, slices[i]);
-    } else {
-      lru_cache_.Put(hash, RaidenBlockId());
-    }
-  }
-
-  for (size_t idx = 0; idx < new_indices.size(); ++idx) {
-    size_t i = new_indices[idx];
-    if (!lru_cache_.Pin(block_hashes[i])) {
-      for (size_t j = 0; j < idx; ++j) {
-        lru_cache_.Unpin(block_hashes[new_indices[j]]);
-      }
-      for (size_t j : existing_indices) {
-        lru_cache_.Unpin(block_hashes[j]);
-      }
-      for (size_t j : new_indices) {
-        if (const RaidenBlockId* val =
-                lru_cache_.PeekIncludingCandidates(block_hashes[j])) {
-          ClearMetadataEntry(*val);
-        }
-        lru_cache_.Erase(block_hashes[j]);
-      }
-      return false;
-    }
-  }
-
-  return true;
-}
-
-size_t HostOffloadBackend::ReleaseAndDelete(
-    absl::Span<const std::string> block_hashes) {
-  absl::MutexLock lock(mutex_);
-  size_t deleted_blocks = 0;
-
-  for (auto it = block_hashes.rbegin(); it != block_hashes.rend(); ++it) {
-    lru_cache_.Unpin(*it);
-  }
-
-  for (const std::string& hash : block_hashes) {
-    auto* val = lru_cache_.Peek(hash);
-    if (val != nullptr && lru_cache_.GetPinCount(hash) == 0 &&
-        val->status != BlockStatus::HOST &&
-        val->status != BlockStatus::HOST_AND_HBM) {
-      lru_cache_.Erase(hash);
-      deleted_blocks++;
-    }
-  }
-
-  return deleted_blocks;
+  return false;
 }
 
 void HostOffloadBackend::Delete(absl::Span<const std::string> block_hashes,
@@ -954,50 +961,6 @@ HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
   return (*client)->PollWriteRemote(operation_id, wait_ms);
 }
 
-bool HostOffloadBackend::InsertAllOrNothing(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices) {
-  if (block_hashes.empty() || block_hashes.size() != slices.size()) {
-    return false;
-  }
-  absl::MutexLock lock(mutex_);
-
-  // Phase 1: validate the whole batch before touching anything.
-  // - PeekIncludingCandidates, not Contains: an eviction candidate is still
-  //   HOST and must count as a duplicate.
-  // - available_space(), not capacity(): pinned entries take space.
-  for (const auto& hash : block_hashes) {
-    if (lru_cache_.PeekIncludingCandidates(hash) != nullptr) {
-      return false;
-    }
-  }
-  if (block_hashes.size() > lru_cache_.available_space()) {
-    return false;
-  }
-
-  // Phase 2: insert. Phase 1 rejected duplicates, so Put never rebinds an
-  // existing hash. Put can also silently insert nothing (e.g. everything
-  // pinned), so each insert is verified and the batch rolled back if not.
-  for (size_t i = 0; i < block_hashes.size(); ++i) {
-    const std::string& hash = block_hashes[i];
-    std::optional<std::pair<std::string, RaidenBlockId>> evicted =
-        lru_cache_.Put(hash, slices[i]);
-    if (lru_cache_.Peek(hash) == nullptr) {
-      LOG(ERROR) << "InsertAllOrNothing: LRUCache::Put inserted nothing for a "
-                    "validated hash; rolling the batch back";
-      for (size_t j = 0; j < i; ++j) {
-        lru_cache_.Erase(block_hashes[j]);
-      }
-      return false;
-    }
-    SetMetadataEntry(hash, slices[i]);
-    // An eviction here only demotes the entry to a candidate; its host block
-    // stays allocated, so there is nothing to free.
-    (void)evicted;
-  }
-  return true;
-}
-
 tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(
     absl::Span<const std::string> block_hashes,
     absl::Span<const int32_t> host_block_ids) {
@@ -1294,7 +1257,7 @@ tsl::Future<> HostOffloadBackend::LoadLocalHostBlocks(
         }
       }
       if (!update_hashes.empty()) {
-        Insert(update_hashes, update_slices, /*on_host=*/true);
+        Insert(update_hashes, update_slices);
         Release(update_hashes);
       }
       load_tracker->MarkDone(hashes);
@@ -1386,7 +1349,7 @@ tsl::Future<> HostOffloadBackend::Save(
             }
           }
           if (!update_hashes.empty()) {
-            Insert(update_hashes, update_slices, /*on_host=*/true);
+            Insert(update_hashes, update_slices);
           }
           save_tracker->MarkDone(hashes);
           save_promise.Set(absl::OkStatus());
