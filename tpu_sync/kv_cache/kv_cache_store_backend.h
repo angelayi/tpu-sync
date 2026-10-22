@@ -233,16 +233,9 @@ class KVCacheStoreBackend {
       absl::Span<const RaidenBlockId> slices,
       InsertOption option = InsertOption::kBestEffortUpdate) = 0;
 
-  // Pins existing hashes and inserts & locks new hashes if space permits.
-  // Performs complete rollback on failure. Returns true on full success.
-  // This is the operation behind the store's public Insert().
-  virtual bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                             absl::Span<const RaidenBlockId> slices,
-                             bool on_host) = 0;
-
-  // Reverts an InsertAndLock operation: unpins hashes, erases non-host blocks
-  // whose pin count drops to 0, and restores candidate evictions.
-  // Returns the number of deleted blocks.
+  // Reverts an Insert(..., InsertOption::kInsertAndPin) operation: unpins
+  // hashes, erases non-host blocks whose pin count drops to 0, and restores
+  // candidate evictions. Returns the number of deleted blocks.
   // Backend-internal: the store facade no longer exposes it; its remaining
   // store-level use is rolling back a multi-backend Insert when a later
   // tier refuses.
@@ -297,19 +290,8 @@ class KVCacheStoreBackend {
 
   // --- Remote write (WriteRemote) & registry helpers -----------------------
   //
-  // Default implementations refuse or return UnimplementedError so backends
-  // that do not support remote writes fail cleanly.
-
-  // Inserts every hash or none, returning false if any part fails.
-  //
-  // Not Insert(): Insert rebinds a hash that is already present, which for a
-  // remote write would orphan the old host block, and it reports partial
-  // success, which would let the source free blocks the destination does not
-  // have.
-  virtual bool InsertAllOrNothing(absl::Span<const std::string> block_hashes,
-                                  absl::Span<const RaidenBlockId> slices) {
-    return false;
-  }
+  // Default implementations return UnimplementedError so backends that do not
+  // support remote writes fail cleanly.
 
   // Publishes `block_hashes` to the global registry asynchronously. Insert()
   // does not publish; a remote write awaits this before reporting COMMITTED.

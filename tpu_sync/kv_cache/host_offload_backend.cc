@@ -562,12 +562,6 @@ bool HostOffloadBackend::InsertAdmitStrict(
   return true;
 }
 
-bool HostOffloadBackend::InsertAndLock(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices, bool /*on_host*/) {
-  return Insert(block_hashes, slices, InsertOption::kInsertAndPin);
-}
-
 size_t HostOffloadBackend::ReleaseAndDelete(
     absl::Span<const std::string> block_hashes) {
   absl::MutexLock lock(mutex_);
@@ -1017,12 +1011,6 @@ HostOffloadBackend::PollWriteRemoteAsync(const RaidenId& dst_raiden_id,
     return tsl::Future<proto::PollWriteRemoteResponse>(client.status());
   }
   return (*client)->PollWriteRemote(operation_id, wait_ms);
-}
-
-bool HostOffloadBackend::InsertAllOrNothing(
-    absl::Span<const std::string> block_hashes,
-    absl::Span<const RaidenBlockId> slices) {
-  return Insert(block_hashes, slices, InsertOption::kAdmitStrict);
 }
 
 tsl::Future<> HostOffloadBackend::RegisterBlocksAsync(

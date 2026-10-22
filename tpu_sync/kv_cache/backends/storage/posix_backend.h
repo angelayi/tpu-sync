@@ -306,12 +306,6 @@ class PosixKVCacheStoreBackend : public KVCacheStoreBackend {
     return option != InsertOption::kAdmitStrict;
   }
 
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override {
-    return true;
-  }
-
   size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override {
     return 0;
   }

@@ -4811,9 +4811,11 @@ TEST_F(RemoteWriteSourceTest, AllExistSettlesDoneWithoutATransfer) {
   auto dst_store = MakeStore(dst);
   RegisterWorker(*src_store);
   Populate(*src_store, src, {"a", "b"});
-  ASSERT_TRUE(dst_store->backend()->InsertAllOrNothing(
-      {"a", "b"}, {RaidenBlockId(dst, 5, BlockStatus::HOST),
-                   RaidenBlockId(dst, 6, BlockStatus::HOST)}));
+  ASSERT_TRUE(
+      dst_store->backend()->Insert({"a", "b"},
+                                   {RaidenBlockId(dst, 5, BlockStatus::HOST),
+                                    RaidenBlockId(dst, 6, BlockStatus::HOST)},
+                                   InsertOption::kAdmitStrict));
 
   ABSL_ASSERT_OK(src_store->Save({"a", "b"}, dst));
 
@@ -4834,8 +4836,9 @@ TEST_F(RemoteWriteSourceTest, PartialExistIsReportedAndNotRetried) {
   auto dst_store = MakeStore(dst);
   RegisterWorker(*src_store);
   Populate(*src_store, src, {"a", "b"});
-  ASSERT_TRUE(dst_store->backend()->InsertAllOrNothing(
-      {"a"}, {RaidenBlockId(dst, 5, BlockStatus::HOST)}));
+  ASSERT_TRUE(dst_store->backend()->Insert(
+      {"a"}, {RaidenBlockId(dst, 5, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
 
   ABSL_ASSERT_OK(src_store->Save({"a", "b"}, dst));
 
@@ -6130,11 +6133,6 @@ class ErrorLookupBackend : public KVCacheStoreBackend {
   bool Insert(absl::Span<const std::string> block_hashes,
               absl::Span<const RaidenBlockId> slices,
               InsertOption option = InsertOption::kBestEffortUpdate) override {
-    return false;
-  }
-  bool InsertAndLock(absl::Span<const std::string> block_hashes,
-                     absl::Span<const RaidenBlockId> slices,
-                     bool on_host) override {
     return false;
   }
   size_t ReleaseAndDelete(absl::Span<const std::string> block_hashes) override {

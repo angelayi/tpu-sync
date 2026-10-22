@@ -731,8 +731,9 @@ TEST_F(WriteRemoteTest, RejectsMissingSourceEndpointsWhenAPullIsNeeded) {
 }
 
 TEST_F(WriteRemoteTest, AllExistNeedsNoSourceEndpoints) {
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)}));
+  ASSERT_TRUE(store_->backend()->Insert(
+      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
 
   std::vector<int32_t> src_ids = {100};
   auto response =
@@ -777,9 +778,11 @@ TEST_F(WriteRemoteTest, RejectsAnOfferFromItself) {
 // Success: the destination already having every hash is what the source
 // wanted.
 TEST_F(WriteRemoteTest, AllExistIsAnImmediateSuccess) {
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"a", "b"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST),
-                   RaidenBlockId(dst_id_, 2, BlockStatus::HOST)}));
+  ASSERT_TRUE(
+      store_->backend()->Insert({"a", "b"},
+                                {RaidenBlockId(dst_id_, 1, BlockStatus::HOST),
+                                 RaidenBlockId(dst_id_, 2, BlockStatus::HOST)},
+                                InsertOption::kAdmitStrict));
 
   auto response = Offer({"a", "b"});
   ABSL_ASSERT_OK(response.status());
@@ -791,8 +794,9 @@ TEST_F(WriteRemoteTest, AllExistIsAnImmediateSuccess) {
 
 // Failure: the destination does no partial writes, and reports what it holds.
 TEST_F(WriteRemoteTest, PartialExistIsRefusedAndNamesWhatItHas) {
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)}));
+  ASSERT_TRUE(store_->backend()->Insert(
+      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
 
   auto response = Offer({"a", "b"});
   ABSL_ASSERT_OK(response.status());
@@ -952,9 +956,11 @@ TEST_F(WriteRemoteTest, LosingTheRaceAtInsertTimeReportsAllExistAndFrees) {
   auto response = Offer({"a", "b"});
   ABSL_ASSERT_OK(response.status());
 
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"a", "b"}, {RaidenBlockId(dst_id_, 6, BlockStatus::HOST),
-                   RaidenBlockId(dst_id_, 7, BlockStatus::HOST)}));
+  ASSERT_TRUE(
+      store_->backend()->Insert({"a", "b"},
+                                {RaidenBlockId(dst_id_, 6, BlockStatus::HOST),
+                                 RaidenBlockId(dst_id_, 7, BlockStatus::HOST)},
+                                InsertOption::kAdmitStrict));
 
   latch_.Release(absl::OkStatus());
   ASSERT_EQ(AwaitTerminal(response->operation_id()),
@@ -969,8 +975,9 @@ TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
   auto response = Offer({"a", "b"});
   ABSL_ASSERT_OK(response.status());
 
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"a"}, {RaidenBlockId(dst_id_, 6, BlockStatus::HOST)}));
+  ASSERT_TRUE(store_->backend()->Insert(
+      {"a"}, {RaidenBlockId(dst_id_, 6, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
 
   latch_.Release(absl::OkStatus());
   ASSERT_EQ(
@@ -988,8 +995,9 @@ TEST_F(WriteRemoteTest, PartialExistDiscoveredAtInsertTimeReachesThePoll) {
 // Landing blocks come from free blocks only; a full destination refuses the
 // write and leaves the cache untouched.
 TEST_F(WriteRemoteTest, RefusesWhenThereAreNoFreeBlocksAndEvictsNothing) {
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"victim"}, {RaidenBlockId(dst_id_, 0, BlockStatus::HOST)}));
+  ASSERT_TRUE(store_->backend()->Insert(
+      {"victim"}, {RaidenBlockId(dst_id_, 0, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
   ABSL_ASSERT_OK(store_->raiden_controller()->AllocateBlockIds(kCapacity));
 
   auto response = Offer({"a"});
@@ -1010,8 +1018,9 @@ TEST_F(WriteRemoteTest, SpaceCheckRunsOnRefusalAndCommit) {
   service_->SetSpaceCheckFn([&calls] { calls.fetch_add(1); });
 
   // ALL_EXIST allocates nothing.
-  ASSERT_TRUE(store_->backend()->InsertAllOrNothing(
-      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)}));
+  ASSERT_TRUE(store_->backend()->Insert(
+      {"a"}, {RaidenBlockId(dst_id_, 1, BlockStatus::HOST)},
+      InsertOption::kAdmitStrict));
   auto exist_resp = Offer({"a"});
   ABSL_ASSERT_OK(exist_resp.status());
   EXPECT_EQ(exist_resp->exist_state(),
@@ -1503,13 +1512,14 @@ TEST(FetchWithdrawTest, ARefusedFetchKeepsAnEvictionCandidatesEntry) {
                               {RaidenBlockId(src_id, 10, BlockStatus::HOST)}));
   ABSL_ASSERT_OK(registry->Register({{"demoted", src_id, 10}}));
 
-  // InsertAndLock, not Insert: it discards what Put displaces, on purpose --
-  // the displaced entry becomes a candidate that still holds its host block.
-  // So this demotes "demoted" and withdraws nothing, which is exactly the
-  // state the refusal below must not mistake for a dead entry.
-  ASSERT_TRUE(backend->InsertAndLock(
-      {"newcomer"}, {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
-      /*on_host=*/true));
+  // Insert(kInsertAndPin), not Insert(kBestEffortUpdate): it discards what Put
+  // displaces, on purpose -- the displaced entry becomes a candidate that still
+  // holds its host block. So this demotes "demoted" and withdraws nothing,
+  // which is exactly the state the refusal below must not mistake for a dead
+  // entry.
+  ASSERT_TRUE(backend->Insert({"newcomer"},
+                              {RaidenBlockId(src_id, 11, BlockStatus::HOST)},
+                              InsertOption::kInsertAndPin));
   ASSERT_THAT(HostOffloadBackendTest::GetEvictCandidateKeys(
                   *static_cast<HostOffloadBackend*>(backend)),
               Contains("demoted"));
