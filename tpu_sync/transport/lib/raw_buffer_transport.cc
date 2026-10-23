@@ -70,6 +70,7 @@
 #define IOV_MAX 1024
 #endif
 #include "absl/status/status_macros.h"
+#include "peregrine/src/api/v1/conn_pool.h"
 #include "peregrine/src/api/v1/histogram.h"
 #include "peregrine/src/api/v1/ip_util.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
@@ -79,7 +80,6 @@
 #include "tpu_sync/telemetry/metrics_backend.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 

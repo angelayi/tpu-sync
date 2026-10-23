@@ -58,6 +58,7 @@
 #include "grpcpp/server.h"
 #include "grpcpp/server_builder.h"
 #include "grpcpp/support/channel_arguments.h"
+#include "peregrine/src/api/v1/conn_pool.h"
 #include "peregrine/src/api/v1/conn_util.h"
 #include "peregrine/src/api/v1/socket_util.h"
 #include "tpu_sync/fault_injection/fault_injector.h"
@@ -67,7 +68,6 @@
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
 #include "tpu_sync/transport/lib/chunk_serializer.h"
-#include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/psp/peregrine_control_service.h"
 #include "tpu_sync/transport/lib/psp/psp_syscall_mock.h"  // NOLINT
 #include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
@@ -77,6 +77,7 @@ namespace tpu_raiden::transport::lib {
 namespace {
 
 using ::peregrine::v1::ConnectToPeer;
+using ::peregrine::v1::ConnPool;
 using ::peregrine::v1::ReadExact;
 using ::peregrine::v1::WriteExact;
 

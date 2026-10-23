@@ -37,13 +37,13 @@
 #include "absl/time/time.h"
 #include "absl/types/span.h"
 #include "grpcpp/channel.h"
+#include "peregrine/src/api/v1/conn_pool.h"
 #include "peregrine/src/api/v1/rate_limiter.h"
 #include "tpu_sync/common/detached_thread_group.h"
 #include "tpu_sync/core/numa_thread_pool.h"
 #include "tpu_sync/telemetry/metrics_api.h"
 #include "tpu_sync/transport/buffer_push_task.h"
 #include "tpu_sync/transport/lib/chunk.h"
-#include "tpu_sync/transport/lib/conn/pool.h"
 #include "tpu_sync/transport/lib/psp/tcp_psp_helper.h"
 #include "tpu_sync/transport/lib/raw_buffer_transport_delegate.h"
 
@@ -240,7 +240,7 @@ class RawBufferTransport final {
 
   // The conn_pool_ owns the sockets that connect to peers. In comparison, the
   // active_client_fds above are those sockets accepted from peers.
-  ConnPool conn_pool_;
+  ::peregrine::v1::ConnPool conn_pool_;
 
   absl::Mutex raw_progress_mu_;
   absl::flat_hash_map<uint64_t, RawProgress> raw_progress_
